@@ -13,9 +13,9 @@ Interface contract (do not change function signatures):
 import torch
 import math
 
-GROUP_SIZE = 16
-BITS = 3
-MAX_VAL = (1 << BITS) - 1  # 7
+GROUP_SIZE = 4
+BITS = 2
+MAX_VAL = (1 << BITS) - 1  # 3
 
 _hadamard_cache = {}
 
