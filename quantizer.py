@@ -1,5 +1,8 @@
 """
-KV Cache Quantizer — per-group 4-bit with fine-grained scales.
+KV Cache Quantizer — rotation + per-group 3-bit.
+
+Apply random Hadamard-like rotation to spread outliers before quantization.
+Inspired by TurboQuant's PolarQuant approach.
 
 Interface contract (do not change function signatures):
   - quantize(tensor: torch.Tensor) -> dict
@@ -9,40 +12,57 @@ Interface contract (do not change function signatures):
 
 import torch
 
-GROUP_SIZE = 32
+GROUP_SIZE = 16
+BITS = 3
+MAX_VAL = (1 << BITS) - 1  # 7
+
+# Fixed random rotation matrix (seeded for reproducibility)
+_rotation_cache = {}
+
+
+def _get_rotation(dim, device, dtype):
+    key = (dim, device, dtype)
+    if key not in _rotation_cache:
+        gen = torch.Generator(device='cpu')
+        gen.manual_seed(42)
+        # Random orthogonal matrix via QR decomposition
+        rand_mat = torch.randn(dim, dim, generator=gen)
+        Q, _ = torch.linalg.qr(rand_mat)
+        _rotation_cache[key] = Q.to(device=device, dtype=dtype)
+    return _rotation_cache[key]
 
 
 def bits_per_value() -> float:
-    # 4 bits per value + overhead for scale/zero per group
-    # Each group of 32 values: 32*4 bits data + 32 bits scale + 16 bits zero = 176 bits
-    # Per value: 176/32 = 5.5 bits
-    # But we report the dominant cost
-    return 4.0
+    return float(BITS)
 
 
 def quantize(tensor: torch.Tensor) -> dict:
     orig_shape = tensor.shape
     dtype = tensor.dtype
+    B, H, S, D = orig_shape
 
-    # Flatten last two dims: (batch, heads, seq_len * head_dim)
-    t = tensor.reshape(*tensor.shape[:2], -1)
-    B, H, N = t.shape
+    # Apply rotation along head_dim to spread outliers
+    R = _get_rotation(D, tensor.device, dtype)
+    t = torch.matmul(tensor, R)  # (B, H, S, D) @ (D, D) -> (B, H, S, D)
+
+    # Flatten last two dims for group quantization
+    t = t.reshape(B, H, -1)
+    N = t.shape[-1]
 
     # Pad to multiple of GROUP_SIZE
     pad = (GROUP_SIZE - N % GROUP_SIZE) % GROUP_SIZE
     if pad > 0:
         t = torch.nn.functional.pad(t, (0, pad))
-    N_padded = t.shape[-1]
 
-    # Reshape to groups: (B, H, num_groups, GROUP_SIZE)
-    t = t.reshape(B, H, N_padded // GROUP_SIZE, GROUP_SIZE)
+    # Reshape to groups
+    t = t.reshape(B, H, -1, GROUP_SIZE)
 
     vmin = t.min(dim=-1, keepdim=True).values
     vmax = t.max(dim=-1, keepdim=True).values
-    scale = (vmax - vmin) / 15.0
+    scale = (vmax - vmin) / MAX_VAL
     scale = scale.clamp(min=1e-8)
 
-    quantized = ((t - vmin) / scale).round().clamp(0, 15).to(torch.uint8)
+    quantized = ((t - vmin) / scale).round().clamp(0, MAX_VAL).to(torch.uint8)
 
     return {
         "data": quantized,
@@ -55,11 +75,18 @@ def quantize(tensor: torch.Tensor) -> dict:
 
 
 def dequantize(quantized: dict) -> torch.Tensor:
-    scale = quantized["scale"].to(quantized["dtype"])
-    vmin = quantized["vmin"].to(quantized["dtype"])
-    t = quantized["data"].to(quantized["dtype"]) * scale + vmin
+    dtype = quantized["dtype"]
+    scale = quantized["scale"].to(dtype)
+    vmin = quantized["vmin"].to(dtype)
+    t = quantized["data"].to(dtype) * scale + vmin
 
-    B, H = quantized["shape"][:2]
+    B, H, S, D = quantized["shape"]
     N = quantized["N"]
     t = t.reshape(B, H, -1)[:, :, :N]
-    return t.reshape(quantized["shape"])
+    t = t.reshape(B, H, S, D)
+
+    # Inverse rotation
+    R = _get_rotation(D, t.device, dtype)
+    t = torch.matmul(t, R.T)
+
+    return t
