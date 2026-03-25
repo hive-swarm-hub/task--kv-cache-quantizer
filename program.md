@@ -30,7 +30,9 @@ We evaluate on long text passages from LongBench using Llama-3.1-8B-Instruct. Fo
 - Modify model weights or architecture
 - Add new Python files (keep everything in `quantizer.py`)
 
-**The goal: maximize compression score.** Score = 32.0 / bits_per_value, but only if quantized perplexity increases by no more than 0.02 over the unquantized baseline (ppl_diff <= 0.02). If perplexity degrades beyond that, score = 0. Higher is better.
+**The goal: maximize compression ratio.** Score = `original_bytes / zstd_compressed_bytes` of the quantized representation, but only if quantized perplexity increases by no more than 0.02 over the unquantized baseline (ppl_diff <= 0.02). If perplexity degrades beyond that, score = 0. Higher is better.
+
+**Note:** The eval serializes the quantized dict (all tensors + metadata), compresses with zstandard level 22, and measures the compressed size. This rewards both efficient quantization AND efficient data representation.
 
 **Simplicity criterion**: All else being equal, simpler is better.
 
@@ -39,7 +41,9 @@ We evaluate on long text passages from LongBench using Llama-3.1-8B-Instruct. Fo
 ```
 ---
 score:            <value>
-bits_per_value:   <value>
+compression:      <value>
+orig_bytes:       <value>
+compressed_bytes: <value>
 baseline_ppl:     <value>
 quantized_ppl:    <value>
 ppl_diff:         <value>

@@ -4,3 +4,4 @@ accelerate
 rouge-score
 sentencepiece
 protobuf
+zstandard

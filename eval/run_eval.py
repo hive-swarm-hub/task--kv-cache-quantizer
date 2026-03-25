@@ -10,6 +10,8 @@ import sys
 import os
 import glob
 import math
+import zstandard as zstd
+import io
 import torch
 from pathlib import Path
 
@@ -24,6 +26,28 @@ BASELINE_CACHE = TASK_DIR / "data" / "baseline_ppl.json"
 # then we measure perplexity on the next EVAL_TOKENS.
 PREFIX_TOKENS = 2048
 EVAL_TOKENS = 512
+
+def serialize_quantized(quantized_dict):
+    """Serialize a quantized dict to bytes for size measurement."""
+    buf = io.BytesIO()
+    # Save all tensors and metadata
+    save_dict = {}
+    for k, v in quantized_dict.items():
+        if isinstance(v, torch.Tensor):
+            save_dict[k] = v.cpu()
+        elif isinstance(v, torch.dtype):
+            save_dict[k + "_dtype_str"] = str(v)
+        else:
+            save_dict[k] = v
+    torch.save(save_dict, buf)
+    return buf.getvalue()
+
+
+def compressed_size(quantized_dict):
+    """Get zstd-compressed size of the quantized representation in bytes."""
+    raw = serialize_quantized(quantized_dict)
+    cctx = zstd.ZstdCompressor(level=22)
+    return len(cctx.compress(raw))
 
 
 def load_passages():
@@ -79,11 +103,14 @@ def compute_ppl_quantized(model, tokenizer, passages, quantize_fn, dequantize_fn
 
     Strategy: process prefix to build KV cache, quantize+dequantize it,
     then measure loss on subsequent tokens using the reconstructed cache.
+    Also measures effective bits per value from the quantized representation.
     """
     from transformers import DynamicCache
 
     total_loss = 0.0
     total_tokens = 0
+    total_orig_bytes = 0
+    total_compressed_bytes = 0
 
     for i, text in enumerate(passages):
         tokens = tokenizer(text, return_tensors="pt", truncation=True,
@@ -101,12 +128,21 @@ def compute_ppl_quantized(model, tokenizer, passages, quantize_fn, dequantize_fn
             prefix_out = model(prefix_ids, use_cache=True)
             past_kv = prefix_out.past_key_values
 
-            # Quantize and dequantize the KV cache
+            # Quantize and dequantize the KV cache, measuring compression
             new_cache = DynamicCache()
             for layer in past_kv.layers:
                 k, v = layer.keys, layer.values
-                dk = dequantize_fn(quantize_fn(k))
-                dv = dequantize_fn(quantize_fn(v))
+                qk = quantize_fn(k)
+                qv = quantize_fn(v)
+
+                # Measure compressed size (only on first passage to avoid overhead)
+                if i == 0:
+                    total_orig_bytes += k.numel() * 2 + v.numel() * 2  # fp16 = 2 bytes
+                    total_compressed_bytes += compressed_size(qk)
+                    total_compressed_bytes += compressed_size(qv)
+
+                dk = dequantize_fn(qk)
+                dv = dequantize_fn(qv)
                 layer_idx = len(new_cache.layers)
                 new_cache.update(dk, dv, layer_idx)
 
@@ -137,7 +173,9 @@ def compute_ppl_quantized(model, tokenizer, passages, quantize_fn, dequantize_fn
         if (i + 1) % 10 == 0:
             print(f"  quantized [{i+1}/{len(passages)}] running_ppl={math.exp(total_loss / total_tokens):.4f}")
 
-    return math.exp(total_loss / total_tokens) if total_tokens > 0 else float("inf"), total_tokens
+    compression_ratio = total_orig_bytes / total_compressed_bytes if total_compressed_bytes > 0 else 0.0
+    ppl = math.exp(total_loss / total_tokens) if total_tokens > 0 else float("inf")
+    return ppl, total_tokens, compression_ratio, total_orig_bytes, total_compressed_bytes
 
 
 def main():
@@ -174,25 +212,28 @@ def main():
 
     # Compute quantized perplexity
     print("Computing quantized perplexity...")
-    quant_ppl, n_tokens_q = compute_ppl_quantized(
+    quant_ppl, n_tokens_q, compression_ratio, orig_bytes, comp_bytes = compute_ppl_quantized(
         model, tokenizer, passages, quantizer.quantize, quantizer.dequantize, device
     )
     print(f"Quantized perplexity: {quant_ppl:.4f} ({n_tokens_q} tokens)")
+    print(f"Compression: {orig_bytes:,} bytes -> {comp_bytes:,} bytes (zstd-22)")
+    print(f"Compression ratio: {compression_ratio:.2f}x")
 
-    bpv = quantizer.bits_per_value()
     ppl_diff = quant_ppl - baseline_ppl
 
-    # Score: 32/bpv if perplexity increase <= 0.02 (absolute)
+    # Score = compression_ratio if ppl_diff <= 0.02, else 0
     MAX_PPL_INCREASE = 0.02
     if ppl_diff <= MAX_PPL_INCREASE:
-        score = 32.0 / bpv
+        score = compression_ratio
     else:
         score = 0.0
 
     print()
     print("---")
     print(f"score:            {score:.4f}")
-    print(f"bits_per_value:   {bpv:.1f}")
+    print(f"compression:      {compression_ratio:.2f}")
+    print(f"orig_bytes:       {orig_bytes}")
+    print(f"compressed_bytes: {comp_bytes}")
     print(f"baseline_ppl:     {baseline_ppl:.4f}")
     print(f"quantized_ppl:    {quant_ppl:.4f}")
     print(f"ppl_diff:         {ppl_diff:.4f}")
